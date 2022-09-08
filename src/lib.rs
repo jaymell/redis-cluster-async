@@ -375,12 +375,12 @@ where
         };
         match ready!(future.poll(cx)) {
             (_, Ok(item)) => {
-                trace!("Ok");
+                println!("Ok");
                 self.respond(Ok(item));
                 Next::Done.into()
             }
             (addr, Err(err)) => {
-                trace!("Request error {}", err);
+                println!("Request error {}", err);
 
                 let request = this.request.as_mut().unwrap();
 
@@ -391,6 +391,7 @@ where
                     }
                     _ => (),
                 }
+                println!("retrying retries {}", request.retry);
                 request.retry = request.retry.saturating_add(1);
 
                 if let Some(error_code) = err.code() {
@@ -710,8 +711,12 @@ where
 
         loop {
             let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
-                Poll::Ready(Some(result)) => result,
-                Poll::Ready(None) | Poll::Pending => break,
+                Poll::Ready(Some(result)) => {
+                    println!("ITS READY");
+                    result}
+                Poll::Ready(None) | Poll::Pending => {
+                    println!("BREAKING");
+                    break },
             };
             let self_ = &mut *self;
             match result {
@@ -740,6 +745,7 @@ where
         }
 
         if let Some(err) = connection_error {
+            println!("GOT HERE");
             Poll::Ready(Err(err))
         } else if self.in_flight_requests.is_empty() {
             Poll::Ready(Ok(()))
@@ -848,7 +854,7 @@ where
                 ConnectionState::PollComplete => match ready!(self.poll_complete(cx)) {
                     Ok(()) => return Poll::Ready(Ok(())),
                     Err(err) => {
-                        trace!("Recovering {}", err);
+                        println!("Recovering {}", err);
                         self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
                     }
                 },
@@ -904,9 +910,18 @@ where
                         "redis_cluster: Unable to send command",
                     ))
                 })?;
-            receiver
-                .await
+
+                println!("HERE1");
+                let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
+                    .map_err(|e| RedisError::from(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "redis_cluster: command timed out",
+                    )))?;
+
+                println!("HERE2");
+                res
                 .unwrap_or_else(|_| {
+                    println!("YEP GOT HERE");
                     Err(RedisError::from(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "redis_cluster: Unable to receive command",
@@ -946,9 +961,15 @@ where
                 .await
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
-            receiver
-                .await
+                let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
+                .map_err(|e| RedisError::from(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "redis_cluster: command timed out",
+                )))?;
+
+                res
                 .unwrap_or_else(|_| {
+                    println!("YEP GOT HERE");
                     Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
                 })
                 .map(|response| match response {
