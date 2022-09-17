@@ -68,7 +68,7 @@ use futures::{
     prelude::*,
     ready, stream,
 };
-use log::trace;
+use log::{trace, info};
 use pin_project_lite::pin_project;
 use rand::seq::IteratorRandom;
 use rand::thread_rng;
@@ -149,18 +149,19 @@ where
         initial_nodes: &[ConnectionInfo],
         retries: Option<u32>,
     ) -> RedisResult<Connection<C>> {
-        Pipeline::new(initial_nodes, retries).await.map(|pipeline| {
-            let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
+        Pipeline::new(initial_nodes, retries).await
+            .map(|pipeline| {
+                let (tx, mut rx) = mpsc::channel::<Message<_>>(100);
 
-            tokio::spawn(async move {
-                let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
-                    .map(Ok)
-                    .forward(pipeline)
-                    .await;
-            });
+                tokio::spawn(async move {
+                    let _ = stream::poll_fn(move |cx| rx.poll_recv(cx))
+                        .map(Ok)
+                        .forward(pipeline)
+                        .await;
+                });
 
-            Connection(tx)
-        })
+                Connection(tx)
+            })
     }
 }
 
@@ -374,13 +375,13 @@ where
             _ => panic!("Request future must be Some"),
         };
         match ready!(future.poll(cx)) {
-            (_, Ok(item)) => {
-                println!("Ok");
+            (s, Ok(item)) => {
+                info!("Request Future READY/responded OK: {}", s);
                 self.respond(Ok(item));
                 Next::Done.into()
             }
             (addr, Err(err)) => {
-                println!("Request error {}", err);
+                info!("REQUEST ERROR {} {}", addr, err);
 
                 let request = this.request.as_mut().unwrap();
 
@@ -391,12 +392,13 @@ where
                     }
                     _ => (),
                 }
-                println!("retrying retries {}", request.retry);
+                info!("CURRENT REQUEST RETRY COUNT {}", request.retry);
                 request.retry = request.retry.saturating_add(1);
 
                 if let Some(error_code) = err.code() {
                     if error_code == "MOVED" || error_code == "ASK" {
                         // Refresh slots and request again.
+                        info!("GOING TO REFRESH SLOTS AND REQUEST AGAIN");
                         request.info.excludes.clear();
                         return Next::Err {
                             request: this.request.take().unwrap(),
@@ -415,6 +417,7 @@ where
                     }
                 }
 
+                info!("ADDING TO EXCLUDES: {}", addr);
                 request.info.excludes.insert(addr);
 
                 Next::TryNewConnection {
@@ -467,6 +470,7 @@ where
         let (slots, connections) = connection.refresh_slots().await.map_err(|(err, _)| err)?;
         connection.slots = slots;
         connection.connections = connections;
+        info!("CONNECTIONS LENGTH {}", connection.connections.len());
         Ok(connection)
     }
 
@@ -480,8 +484,14 @@ where
                         Some(pw) => format!("redis://:{}@{}:{}", pw, host, port),
                         None => format!("redis://{}:{}", host, port),
                     },
-                    ConnectionAddr::TcpTls { ref host, port, insecure } => match &info.redis.password {
-                        Some(pw) if insecure => format!("rediss://:{}@{}:{}/#insecure", pw, host, port),
+                    ConnectionAddr::TcpTls {
+                        ref host,
+                        port,
+                        insecure,
+                    } => match &info.redis.password {
+                        Some(pw) if insecure => {
+                            format!("rediss://:{}@{}:{}/#insecure", pw, host, port)
+                        }
                         Some(pw) => format!("rediss://:{}@{}:{}", pw, host, port),
                         None if insecure => format!("rediss://{}:{}/#insecure", host, port),
                         None => format!("rediss://{}:{}", host, port),
@@ -495,7 +505,7 @@ where
                     Err(e) => {
                         trace!("Failed to connect to initial node: {:?}", e);
                         None
-                    },
+                    }
                 }
             })
             .buffer_unordered(initial_nodes.len())
@@ -521,6 +531,7 @@ where
         &mut self,
     ) -> impl Future<Output = Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>
     {
+        info!("REFRESHING SLOTS");
         let mut connections = mem::replace(&mut self.connections, Default::default());
         let use_tls = self.tls;
 
@@ -547,6 +558,8 @@ where
             // Remove dead connections and connect to new nodes if necessary
             let new_connections = HashMap::with_capacity(connections.len());
 
+            info!("CONNECTIONS LEN PRE-REMOVAL: {}", connections.len());
+            info!("REMOVING DEAD CONNECTIONS");
             let (_, connections) = stream::iter(slots.values())
                 .fold(
                     (connections, new_connections),
@@ -576,6 +589,7 @@ where
                     },
                 )
                 .await;
+            info!("CONNECTIONS LEN POST-REMOVAL: {}", connections.len());
             Ok((slots, connections))
         }
     }
@@ -677,6 +691,7 @@ where
                 Poll::Pending
             }
             Poll::Ready(Err((err, connections))) => {
+                info!("Poll recover referesh slots");
                 self.connections = connections;
                 self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
                 Poll::Ready(Err(err))
@@ -711,23 +726,22 @@ where
 
         loop {
             let result = match Pin::new(&mut self.in_flight_requests).poll_next(cx) {
-                Poll::Ready(Some(result)) => {
-                    println!("ITS READY");
-                    result}
-                Poll::Ready(None) | Poll::Pending => {
-                    println!("BREAKING");
-                    break },
+                Poll::Ready(Some(result)) => result,
+                Poll::Ready(None) | Poll::Pending => break,
             };
             let self_ = &mut *self;
             match result {
                 Next::Done => {}
                 Next::TryNewConnection { request, error } => {
                     if let Some(error) = error {
+                        info!("TryNewConnection error {}", error);
                         if request.info.excludes.len() >= self_.connections.len() {
+                            info!("SENDING SENDER ERROR");
                             let _ = request.sender.send(Err(error));
                             continue;
                         }
                     }
+                    info!("TRYING REQUEST AGAIN");
                     let future = self.try_request(&request.info);
                     self.in_flight_requests.push(Box::pin(Request {
                         max_retries: self.retries,
@@ -745,7 +759,7 @@ where
         }
 
         if let Some(err) = connection_error {
-            println!("GOT HERE");
+            info!("CONNECTION ERROR");
             Poll::Ready(Err(err))
         } else if self.in_flight_requests.is_empty() {
             Poll::Ready(Ok(()))
@@ -806,6 +820,7 @@ where
 
     fn start_send(mut self: Pin<&mut Self>, msg: Message<C>) -> Result<(), Self::Error> {
         trace!("start_send");
+        info!("START SEND");
         let Message { cmd, sender } = msg;
 
         let excludes = HashSet::new();
@@ -854,7 +869,7 @@ where
                 ConnectionState::PollComplete => match ready!(self.poll_complete(cx)) {
                     Ok(()) => return Poll::Ready(Ok(())),
                     Err(err) => {
-                        println!("Recovering {}", err);
+                        info!("Poll flush refresh slots{}", err);
                         self.state = ConnectionState::Recover(Box::pin(self.refresh_slots()));
                     }
                 },
@@ -888,7 +903,7 @@ where
     C: ConnectionLike + Send + 'static,
 {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> RedisFuture<'a, Value> {
-        trace!("req_packed_command");
+        info!("req_packed_command");
         let (sender, receiver) = oneshot::channel();
         Box::pin(async move {
             self.0
@@ -911,24 +926,27 @@ where
                     ))
                 })?;
 
-                println!("HERE1");
-                let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
-                    .map_err(|e| RedisError::from(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "redis_cluster: command timed out",
-                    )))?;
+            // let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
+            //     .map_err(|e| RedisError::from(io::Error::new(
+            //         io::ErrorKind::BrokenPipe,
+            //         "redis_cluster: command timed out",
+            //     )))?;
 
-                println!("HERE2");
-                res
+            // res
+            receiver
+                .await
                 .unwrap_or_else(|_| {
-                    println!("YEP GOT HERE");
+                    info!("FAILURE RECEIVING FROM RECEIVER");
                     Err(RedisError::from(io::Error::new(
                         io::ErrorKind::BrokenPipe,
                         "redis_cluster: Unable to receive command",
                     )))
                 })
                 .map(|response| match response {
-                    Response::Single(value) => value,
+                    Response::Single(value) => {
+                        info!("SINGLE");
+                        value
+                    }
                     Response::Multiple(_) => unreachable!(),
                 })
         })
@@ -961,15 +979,17 @@ where
                 .await
                 .map_err(|_| RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))?;
 
-                let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
-                .map_err(|e| RedisError::from(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    "redis_cluster: command timed out",
-                )))?;
+            // let res = tokio::time::timeout(tokio::time::Duration::from_millis(200), receiver).await
+            // .map_err(|e| RedisError::from(io::Error::new(
+            //     io::ErrorKind::TimedOut,
+            //     "redis_cluster: command timed out",
+            // )))?;
 
-                res
+            // res
+            receiver
+                .await
                 .unwrap_or_else(|_| {
-                    println!("YEP GOT HERE");
+                    info!("GOING TO SEND BROKEN PIPE ERROR");
                     Err(RedisError::from(io::Error::from(io::ErrorKind::BrokenPipe)))
                 })
                 .map(|response| match response {
@@ -1037,7 +1057,7 @@ fn get_random_connection<'a, C>(
 where
     C: Clone,
 {
-    debug_assert!(!connections.is_empty());
+    // debug_assert!(!connections.is_empty());
 
     let mut rng = thread_rng();
     let sample = match excludes {
