@@ -532,12 +532,13 @@ where
     ) -> impl Future<Output = Result<(SlotMap, ConnectionMap<C>), (RedisError, ConnectionMap<C>)>>
     {
         println!("REFRESHING SLOTS");
-        let mut connections = mem::replace(&mut self.connections, Default::default());
+        let connections = mem::replace(&mut self.connections, Default::default());
+        println!("SELF.CONNECTIONS LEN {}", self.connections.len());
         let use_tls = self.tls;
 
         async move {
             let mut result = Ok(SlotMap::new());
-            for (addr, conn) in connections.iter_mut() {
+            for (addr, conn) in connections.iter() {
                 let mut conn = conn.clone().await;
                 match get_slots(addr, &mut conn, use_tls)
                     .await
@@ -555,12 +556,13 @@ where
                 Err(err) => return Err((err, connections)),
             };
 
+            let old_connections = connections.clone();
             // Remove dead connections and connect to new nodes if necessary
             let new_connections = HashMap::with_capacity(connections.len());
 
             println!("CONNECTIONS LEN PRE-REMOVAL: {}", connections.len());
             println!("REMOVING DEAD CONNECTIONS");
-            let (_, connections) = stream::iter(slots.values())
+            let (_, these_new_connections) = stream::iter(slots.values())
                 .fold(
                     (connections, new_connections),
                     move |(mut connections, mut new_connections), addr| async move {
@@ -589,8 +591,15 @@ where
                     },
                 )
                 .await;
-            println!("CONNECTIONS LEN POST-REMOVAL: {}", connections.len());
-            Ok((slots, connections))
+            println!("CONNECTIONS LEN POST-REMOVAL: {}", these_new_connections.len());
+
+            if these_new_connections.len() == 0 {
+                println!("WARN GOT NEW CONN LEN 0 NOT REPLACING");
+                Ok((slots, old_connections))
+            } else {
+
+                Ok((slots, these_new_connections))
+            }
         }
     }
 
